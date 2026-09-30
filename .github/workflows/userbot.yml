@@ -50,6 +50,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Cek konfigurasi runner
+        id: konfig
         run: |
           hilang=""
           [ -n "$DATA_REPO" ] || hilang="$hilang DATA_REPO (variable)"
@@ -113,7 +114,10 @@ jobs:
           if-no-files-found: warn
 
       - name: Jadwalkan run berikutnya
-        if: always()
+        # Hanya kalau konfigurasi dan data siap. Kalau secrets belum
+        # lengkap atau frasa sandi salah, rantai tidak diulang sendiri
+        # (mataikan output tiap 5 menit); cron 5 jam yang mencoba lagi.
+        if: always() && steps.konfig.outcome == 'success' && steps.tarik.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
