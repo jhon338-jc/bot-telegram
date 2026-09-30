@@ -283,7 +283,7 @@ Cara pakai (klik ganda `layanan.bat`, lalu pilih **1. Install**):
 
 ```bat
 layanan.bat                 :: menu
-powershell -File service.ps1 install     ::-autostart + jalan sekarang
+powershell -File service.ps1 install     :: autostart + jalan sekarang
 powershell -File service.ps1 status      :: cek status + log
 powershell -File service.ps1 stop        :: hentikan
 powershell -File service.ps1 uninstall   :: hapus autostart
@@ -340,7 +340,7 @@ jeda panjang, setiap run selesai memicu **run berikutnya** lewat
 `repository_dispatch`; cron `*/5` cuma jaring pengaman kalau rantai itu
 terputus. Efeknya bot di-restart tiap ~5 jam dengan jeda beberapa detik:
 `server.py --maks-waktu` menutup `main.py` dengan rapi, `tools/pack.py`
-menyimpan datanya, lalu run berikutnyatakes over.
+menyimpan datanya, lalu run berikutnya mengambil alih.
 
 ### Setup (sekali saja, ± 15 menit)
 
