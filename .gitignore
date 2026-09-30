@@ -1,0 +1,38 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Log
+logs/
+*.log
+
+# Database & session runtime
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.session
+data/*.session-journal
+data/server.lock
+data/stop.flag
+
+# Ucapan per grup yang disetel lewat /salam dan /pamit
+data/ucapan.json
+
+# Gambar menu dan cache foto profil akun (privat, jangan di-share)
+data/foto/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Tools
+.env.local
+.env.production
