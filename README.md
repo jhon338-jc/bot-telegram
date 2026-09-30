@@ -123,6 +123,7 @@ telegram-bot/
 ├── service.ps1              # daftarkan autostart ke Task Scheduler
 ├── server.py                # supervisor: jaga main.py tetap hidup
 ├── requirements.txt
+├── LICENSE
 ├── README.md
 ├── config.py                # baca .env, validasi, daftar admin & whitelist
 ├── main.py                  # entry point + argumen --qr / --cek / --reset
@@ -362,3 +363,8 @@ dari akun sendiri diabaikan Telethon (`incoming=True`):
 | Akses ditolak padahal kamu admin                     | Cek dengan `/id`; daftarkan ID kamu di `ADMIN_IDS` lalu restart            |
 | Gagal konek / timeout                                | Cek internet, VPN, firewall, atau ganti jaringan (Wi-Fi / hotspot)         |
 | `ActivationRequiredError`                              | Akun kamu harus lebih dulu aktif di aplikasi Telegram sebelum dipakai     |
+
+## License
+
+MIT. Lihat berkas [LICENSE](LICENSE). Bebas dipakai, diubah, dan dibagikan
+asal menyertakan teks lisensinya.
