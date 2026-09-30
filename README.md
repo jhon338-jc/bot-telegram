@@ -125,11 +125,17 @@ telegram-bot/
 ├── requirements.txt
 ├── LICENSE
 ├── README.md
+├── .github/workflows/
+│   └── userbot.yml          # runner 24/7 gratis: bot jalan terus di Actions
+├── tools/
+│   ├── pack.py              # data/ -> repo privat, terenkripsi (push/pull/check)
+│   └── requirements.txt     # hanya untuk tools/pack.py
 ├── config.py                # baca .env, validasi, daftar admin & whitelist
 ├── main.py                  # entry point + argumen --qr / --cek / --reset
 ├── uji.py                   # smoke test koneksi
 ├── uji_handler.py           # uji seluruh handler & deteksi role
 ├── uji_database.py          # uji skema, migrasi, dan counter database
+├── uji_pack.py              # uji enkripsi & bundling data (tanpa jaringan)
 ├── cek_teks.py              # deteksi karakter asing yang bocor ke source
 ├── handlers/
 │   ├── __init__.py          # registrasi handler + error handler global
@@ -309,6 +315,133 @@ venv\Scripts\python.exe server.py status
 > hidup kembali setelah login. Untuk berhenti total, buka Task Scheduler
 > lalu hapus task `TelegramUserbot`, atau jalankan `service.ps1 uninstall`.
 
+## Deploy Gratis 24/7 di Server (GitHub Actions)
+
+Tidak butuh VPS dan tidak butuh kartu kredit. Yang jadi "server" adalah
+runner **GitHub Actions**, jadi syaratnya ada dua:
+
+1. **Repo ini harus public** — repo privat cuma dapat 2.000 menit Actions
+   per bulan (± 20 jam, belum 24/7), sedangkan repo public tidak
+   dibatasi. Kode project ini lisensi MIT dan memang untuk dibaca, jadi
+   aman dipublikasikan. Semua rahasia tetap di GitHub Secrets.
+2. **Data userbot tidak boleh ikut** — folder `data/` berisi session
+   Telethon yang setara akses penuh ke akun kamu. Isinya dikirim ke **repo
+   privat kedua**, dienkripsi AES-GCM, oleh `tools/pack.py`.
+
+```
+repo PUBLIC  bot-telegram      -> kode + .github/workflows/userbot.yml
+repo PRIVAT  bot-telegram-data -> data.tar.gz.enc (session + db terenkripsi)
+```
+
+### Kenapa bot-nya tetap nyambung 24/7
+
+Actions hanya boleh menjalankan satu job maksimal 6 jam. Supaya tidak ada
+jeda panjang, setiap run selesai memicu **run berikutnya** lewat
+`repository_dispatch`; cron `*/5` cuma jaring pengaman kalau rantai itu
+terputus. Efeknya bot di-restart tiap ~5 jam dengan jeda beberapa detik:
+`server.py --maks-waktu` menutup `main.py` dengan rapi, `tools/pack.py`
+menyimpan datanya, lalu run berikutnyatakes over.
+
+### Setup (sekali saja, ± 15 menit)
+
+**1. Buat repo privat.** Di GitHub buat repo baru `bot-telegram-data`,
+centang **Private**, beri satu README lalu commit (supaya branch `main`
+sudah ada).
+
+**2. Buat token.** GitHub → Settings → Developer settings → Personal
+access tokens → **Fine-grained tokens** → Generate:
+
+| Kolom              | Isi                                                       |
+| ------------------ | --------------------------------------------------------- |
+| Token name         | `bot-telegram-data`                                        |
+| Expiration         | 90 hari (kalau habis, bot berhenti — perpanjang saja)      |
+| Resource owner     | akun kamu                                                  |
+| Repository access  | Only select repositories → `bot-telegram-data`             |
+| Permissions        | **Contents: Read and write**                               |
+
+Salin tokennya (dimulai `github_pat_`).
+
+**3. Buat frasa sandi.** Acak, minimal 20 karakter, simpan di password
+manager. Jangan pakai frasa yang kamu pakai di tempat lain — file ini
+adalah kunci akun Telegram kamu.
+
+**4. Isi Settings di repo public.** Buka repo `bot-telegram` →
+Settings → Secrets and variables → Actions:
+
+| Jenis    | Nama        | Isi                                                |
+| -------- | ----------- | -------------------------------------------------- |
+| Variable | `DATA_REPO` | `usernamekamu/bot-telegram-data`                   |
+| Secret   | `DATA_PAT`  | token dari langkah 2                               |
+| Secret   | `ENC_PASS`  | frasa sandi dari langkah 3                         |
+| Secret   | `ENV_FILE`  | **isi penuh file `.env` kamu** (satu blok teks)    |
+
+> `ENV_FILE` diisi persis seperti isi `.env`: `API_ID=...`, `API_HASH=...`,
+> `PHONE=...`, lalu baris lainnya. Salin blok itu apa adanya. Rahasiakan
+> `OTP_CODE` dan `TWOFA_PASSWORD` kalau masih terisi di `.env` — setelah
+> session tersimpan keduanya tidak perlu lagi.
+
+**5. Hentikan bot di PC lalu unggah datanya.** Session hanya boleh dipakai
+satu proses; kalau bot masih jalan di Windows, proses di server akan
+gagal dengan `AUTH_KEY_DUPLICATED`.
+
+```bat
+venv\Scripts\python.exe server.py stop
+powershell -File service.ps1 uninstall
+venv\Scripts\python.exe -m pip install -r tools\requirements.txt
+```
+
+Lalu di PowerShell (jangan pakai `setx`, cukup untuk sesi ini saja):
+
+```powershell
+$env:DATA_REPO="usernamekamu/bot-telegram-data"
+$env:DATA_PAT="github_pat_..."
+$env:ENC_PASS="frasa-sandi-mu"
+venv\Scripts\python.exe tools\pack.py check
+venv\Scripts\python.exe tools\pack.py push
+```
+
+`check` mencetak isi `data/` dan menguji enkripsinya; `push` mengirim
+bundel terenkripsi ke repo privat.
+
+**6. Jalankan.** Push kode ke GitHub, lalu tab **Actions → Userbot 24/7 →
+Run workflow**. Cek yang muncul di log:
+
+```
+Sesi tersimpan dipakai (tanpa OTP) dalam 0.8 dtk.
+Userbot aktif. Grup yang diizinkan: ...
+```
+
+### Setiap hari
+
+| Yang perlu dicek                          | Cara                                              |
+| ----------------------------------------- | ------------------------------------------------- |
+| Bot masih hidup                           | Tab Actions, run terakhir < 6 jam lalu             |
+| Status                                    | Dari akun Telegram lain: `/stat`                   |
+| Error                                     | Buka run → step "Ringkasan log" atau artifact      |
+| Update kode                               | `git push` — otomatis memicu run baru             |
+| Update konten `.env` /_groups/            | Edit `ENV_FILE`, lalu trigger manual run           |
+
+Kalau bot harus berhenti sementara: tab Actions → workflow → **Disable
+workflow**. Untuk menghidupkan lagi, klik **Enable workflow** lalu run
+manual.
+
+### Batasan yang perlu kamu tahu
+
+- **Restart tiap ~5 jam.** Selama jeda 30–60 detik, pesan yang masuk
+  tidak diproses ulang — `catch_up=False` di `utils/login.py`. Yang paling
+  terbawa adalah `/salam` untuk member yang gabung tepat di detik itu.
+- **IP berubah tiap run.** Sesi Telegram terlihat datang dari IP
+  datacenter GitHub yang berbeda-beda. Risiko flood-wait kecil, tapi
+  bukan nol.
+- **Repo privat = satu-satunya salinanmu.** Kalau bocor, rotasi lewat HP:
+  Settings → Devices → **Terminate session**.
+- **Log bisa dibaca siapa saja.** Artifact `logs-run-*` di Actions milik
+  repo publik, jadi isinya bisa diunduh tanpa login. Karena itu `bot.log`
+  jangan pernah berisi nomor HP, isi chat, atau frasa sandi.
+- **Jangan pernah** commit `.env` atau `data/` ke repo public, dan jangan
+  pakai `actions/cache` untuk session — cache repo public bisa dibaca
+  siapa saja tanpa login.
+
 ## Perintah CLI
 
 | Perintah              | Fungsi                                                      |
@@ -320,6 +453,10 @@ venv\Scripts\python.exe server.py status
 | `python server.py start` | Jalankan supervisor (mode background, tanpa console)    |
 | `python server.py stop`  | Minta supervisor + child berhenti                     |
 | `python server.py status` | Status singkat + 10 baris log terakhir              |
+| `python server.py start --maks-waktu 300` | Supervisor berhenti sendiri setelah 300 menit    |
+| `python tools/pack.py check` | Periksa `data/` + uji enkripsi, tanpa jaringan  |
+| `python tools/pack.py push`  | Kirim `data/` terenkripsi ke repo privat          |
+| `python tools/pack.py pull`  | Ambil `data/` dari repo privat                    |
 | `python uji.py`       | Smoke test: login lalu kirim pesan uji ke chat sendiri      |
 
 ## Cara Menguji
@@ -329,6 +466,7 @@ Jalankan uji otomatis dulu (tidak menyentuh Telegram):
 ```bat
 venv\Scripts\python.exe uji_handler.py
 venv\Scripts\python.exe uji_database.py
+venv\Scripts\python.exe uji_pack.py
 ```
 
 Untuk uji langsung, pakai **akun Telegram lain** — pesan yang kamu kirim
@@ -363,6 +501,11 @@ dari akun sendiri diabaikan Telethon (`incoming=True`):
 | Akses ditolak padahal kamu admin                     | Cek dengan `/id`; daftarkan ID kamu di `ADMIN_IDS` lalu restart            |
 | Gagal konek / timeout                                | Cek internet, VPN, firewall, atau ganti jaringan (Wi-Fi / hotspot)         |
 | `ActivationRequiredError`                              | Akun kamu harus lebih dulu aktif di aplikasi Telegram sebelum dipakai     |
+| `Belum diisi: ENC_PASS` (di Actions)                   | Secret GitHub belum lengkap; isi ulang di Settings → Secrets and variables → Actions |
+| `Frasa sandi salah, atau berkas sudah rusak`           | `ENC_PASS` di server beda dengan yang dipakai saat `push` di PC           |
+| `Repo privat ... belum berisi data.tar.gz.enc`         | Di PC jalankan `python tools/pack.py push` lebih dulu                    |
+| `data/userbot.session tidak ada, jadi tidak ada yang layak dorong` | Step "Tarik data terenkripsi" gagal di run sebelumnya, jadi bundel kosong sengaja tidak diunggah demi melindungi data lama |
+| Bot sering restart di server                           | Buka run terakhir → step "Ringkasan log"; biasanya `FloodWait` atau session dipakai proses lain |
 
 ## License
 

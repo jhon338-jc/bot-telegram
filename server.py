@@ -8,13 +8,17 @@ kali child berhenti (crash, koneksi putus, ``Ctrl+C``) supervisor
 menjalankannya lagi dengan jeda yang bertambah naik.
 
 Registrasi ke Task Scheduler (agar otomatis hidup saat login) dilakukan
-lewat ``service.ps1``, bukan lewat modul ini.
+lewat ``service.ps1``, bukan lewat modul ini. Yang sama berlaku saat
+supervisor dipakai di server Linux (GitHub Actions): ``--maks-waktu``
+membuat supervisor berhenti sendiri secara rapi setelah sejumlah menit,
+supaya platform punya waktu menyimpan data lalu menjalankan ulang.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -32,7 +36,11 @@ STOP_FLAG = BASE_DIR / "data" / "stop.flag"
 LOCK_FILE = BASE_DIR / "data" / "server.lock"
 LOG_FILE = BASE_DIR / "logs" / "server.log"
 
-PYTHON = BASE_DIR / "venv" / "Scripts" / ("pythonw.exe" if os.name == "nt" else "python")
+PYTHON = (
+    BASE_DIR / "venv" / "Scripts" / "pythonw.exe"
+    if os.name == "nt"
+    else BASE_DIR / "venv" / "bin" / "python"
+)
 MAIN = BASE_DIR / "main.py"
 
 # Jeda antar percobaan restart. Naik sampai maksimum supaya bot yang
@@ -132,31 +140,48 @@ def flags_jendela() -> int:
 def hentikan(child: subprocess.Popen) -> None:
     """Akhiri child dengan rapi, paksa kalau tidak mau complies.
 
+    Di Linux/macOS sinyal yang dikirim adalah ``SIGINT``, bukan ``SIGTERM``:
+    ``SIGTERM`` langsung mematikan proses sehingga blok ``finally`` di
+    ``main.py`` tidak sempat jalan dan file session SQLite bisa tertinggal
+    dalam kondisi setengah ditulis. Dengan ``SIGINT`` Telethon disconnect
+    dengan rapi dulu, baru proses selesai.
+
     Args:
         child: Proses ``main.py`` yang sedang berjalan.
     """
-    child.terminate()
+    if os.name == "nt":
+        child.terminate()
+    else:
+        child.send_signal(signal.SIGINT)
     try:
         child.wait(timeout=15)
     except subprocess.TimeoutExpired:
-        log("Child tidak Mau berhenti, dipaksa (kill).")
+        log("Child tidak mau berhenti, dipaksa (kill).")
         child.kill()
 
 
-def jalankan_sekali() -> tuple[int, float]:
+def jalankan_sekali(deadline: float | None) -> tuple[int, float, bool]:
     """Jalankan ``main.py`` sekali dan tunggu sampai selesai.
 
     Selama menunggu, file ``stop.flag`` dipantau setiap detik supaya
     ``server.py stop`` benar-benar menghentikan child yang sedang aktif,
-    bukan hanya menahan restart berikutnya.
+    bukan hanya menahan restart berikutnya. Batas waktu ``deadline``
+    (monotonic) diperlakukan sama seperti permintaan stop, supaya
+    supervisor bisa berhenti sendiri di server yang membatasi durasi job.
+
+    Args:
+        deadline: Batas waktu berupa ``time.monotonic()``, atau ``None``
+            bila supervisor boleh berjalan tanpa batas.
 
     Returns:
-        Tuple ``(exit_code, durasi_detik)``. Exit code ``-1`` berarti
-        child gagal dijalankan sama sekali.
+        Tuple ``(exit_code, durasi_detik, berhenti_diminta)``. Exit code
+        ``-1`` berarti child gagal dijalankan sama sekali, dan
+        ``berhenti_diminta`` ``True`` berarti child dihentikan oleh
+        ``stop.flag`` atau oleh batas waktu.
     """
     if not MAIN.exists():
         log(f"FATAL: {MAIN} tidak ditemukan.")
-        return -1, 0.0
+        return -1, 0.0, False
     try:
         child = subprocess.Popen(
             [str(PYTHON), str(MAIN)],
@@ -165,7 +190,7 @@ def jalankan_sekali() -> tuple[int, float]:
         )
     except OSError as exc:
         log(f"Gagal menjalankan main.py: {exc}")
-        return -1, 0.0
+        return -1, 0.0, False
 
     mulai = time.monotonic()
     log(f"Menjalankan main.py (PID {child.pid}).")
@@ -173,24 +198,33 @@ def jalankan_sekali() -> tuple[int, float]:
         while True:
             try:
                 kode = child.wait(timeout=1)
-                return kode, time.monotonic() - mulai
+                return kode, time.monotonic() - mulai, False
             except subprocess.TimeoutExpired:
                 pass
             if stop_diminta():
                 log("Permintaan stop saat child berjalan, child dihentikan.")
                 hentikan(child)
                 kode = child.returncode if child.returncode is not None else 0
-                return kode, time.monotonic() - mulai
+                return kode, time.monotonic() - mulai, True
+            if deadline is not None and time.monotonic() >= deadline:
+                log("Batas waktu supervisor tercapai, child dihentikan rapi.")
+                hentikan(child)
+                kode = child.returncode if child.returncode is not None else 0
+                return kode, time.monotonic() - mulai, True
     except KeyboardInterrupt:
         # Ctrl+C di console supervisor diteruskan ke child, lalu supervisor
         # ikut berhenti (tidak ada restart).
         log("Ctrl+C diterima, meneruskan ke main.py lalu berhenti.")
         hentikan(child)
-        return 0, time.monotonic() - mulai
+        return 0, time.monotonic() - mulai, True
 
 
-def supervise() -> int:
+def supervise(maks_waktu: float | None = None) -> int:
     """Jalankan ``main.py`` berulang kali selama belum diminta berhenti.
+
+    Args:
+        maks_waktu: Lamanya supervisor boleh berjalan, dalam detik.
+            ``None`` berarti berjalan tanpa batas (perilaku di Windows).
 
     Returns:
         Exit code supervisor (``0`` bila berhenti normal).
@@ -201,17 +235,25 @@ def supervise() -> int:
         log("Supervisor lain sudah berjalan. Tidak ada yang dilakukan.")
         return 1
 
+    deadline = None if maks_waktu is None else time.monotonic() + maks_waktu
     log("=" * 60)
     log(f"Supervisor aktif (PID {os.getpid()}), controlling {MAIN.name}.")
+    if maks_waktu is not None:
+        menit = maks_waktu / 60.0
+        log(
+            f"Batas waktu supervisor: {menit:.0f} menit."
+            if menit >= 1.0
+            else f"Batas waktu supervisor: {maks_waktu:.0f} detik."
+        )
     jeda = BACKOFF_AWAL
     percobaan = 0
 
     try:
         while not stop_diminta():
             percobaan += 1
-            kode, durasi = jalankan_sekali()
+            kode, durasi, berhenti = jalankan_sekali(deadline)
 
-            if stop_diminta():
+            if berhenti or stop_diminta():
                 log("Permintaan berhenti diterima, supervisor selesai.")
                 break
 
@@ -232,10 +274,14 @@ def supervise() -> int:
             else:
                 jeda = min(BACKOFF_MAKS, max(BACKOFF_AWAL, jeda * 1.5))
 
+            sisa = None if deadline is None else max(0.0, deadline - time.monotonic())
+            jeda = min(jeda, sisa) if sisa is not None else jeda
             log(f"Restart dalam {jeda:.0f} detik (percobaan ke-{percobaan}).")
             waktu_tidur = 0.0
             while waktu_tidur < jeda:
                 if stop_diminta():
+                    break
+                if deadline is not None and time.monotonic() >= deadline:
                     break
                 time.sleep(min(1.0, jeda - waktu_tidur))
                 waktu_tidur += 1.0
@@ -262,6 +308,17 @@ def main() -> int:
         choices=("start", "stop", "status"),
         help="start (default) jalankan supervisor, stop hentikan, status cek",
     )
+    parser.add_argument(
+        "--maks-waktu",
+        type=float,
+        default=None,
+        metavar="MENIT",
+        help=(
+            "Berhenti sendiri setelah MENIT menit, child dihentikan lebih "
+            "dulu. Untuk server yang membatasi durasi job (GitHub Actions "
+            "maksimal 6 jam). Tanpa opsi ini supervisor berjalan terus."
+        ),
+    )
     args = parser.parse_args()
 
     if args.aksi == "stop":
@@ -282,7 +339,9 @@ def main() -> int:
         return 0
 
     try:
-        return supervise()
+        return supervise(
+            None if args.maks_waktu is None else args.maks_waktu * 60.0
+        )
     except Exception:
         # pythonw.exe tidak punya stderr, jadi tanpa catch di sini error
         # akan hilang tanpa jejak. Semua kegagalan fatal masuk ke log file.

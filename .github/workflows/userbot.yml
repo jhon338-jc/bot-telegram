@@ -1,0 +1,154 @@
+name: Userbot 24/7
+
+# Bot ini jalan di runner GitHub Actions, bukan di VPS. Yang menjaga agar
+# tetap hidup adalah rangkaian run: setiap run selesai memicu run berikutnya
+# lewat repository_dispatch, sehingga jeda antar run cuma beberapa detik.
+# Cron tiap 5 jam dipakai sebagai jaring pengaman kalau rantai itu putus,
+# misalnya karena schedule dinonaktifkan GitHub setelah repo public tidak
+# ada commit selama 60 hari (step "Heartbeat" yang mencegahnya).
+#
+# Data userbot (session + database) TIDAK ada di repo ini. Repo ini publik
+# demi menit tak terbatas; data dituju ke repo privat terenkripsi oleh
+# tools/pack.py. Jangan pernah commit .env atau data/ ke sini.
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [restart]
+  schedule:
+    - cron: "17 */5 * * *"
+
+# contents: write  -> heartbeat commit supaya schedule tidak dinonaktifkan
+# actions: write   -> memicu run berikutnya
+permissions:
+  contents: write
+  actions: write
+
+# Runs tidak boleh tumpang tindih: satu akun Telegram hanya boleh punya
+# satu session aktif, dua proses akan saling berebut file session.
+concurrency:
+  group: userbot
+  cancel-in-progress: false
+
+jobs:
+  jalankan:
+    name: Supervisor userbot
+    runs-on: ubuntu-latest
+    # Batas keras GitHub adalah 6 jam. Supervisor berhenti sendiri setelah
+    # 5 jam (--maks-waktu) supaya langkah penyimpanan data dan pemicu run
+    # berikutnya sempat jalan.
+    timeout-minutes: 340
+    env:
+      TZ: Asia/Jakarta
+      PYTHONUNBUFFERED: "1"
+      DATA_REPO: ${{ vars.DATA_REPO }}
+      DATA_PAT: ${{ secrets.DATA_PAT }}
+      ENC_PASS: ${{ secrets.ENC_PASS }}
+      ENV_FILE: ${{ secrets.ENV_FILE }}
+    steps:
+      - name: Checkout kode
+        uses: actions/checkout@v4
+
+      - name: Cek konfigurasi runner
+        run: |
+          hilang=""
+          [ -n "$DATA_REPO" ] || hilang="$hilang DATA_REPO (variable)"
+          [ -n "$DATA_PAT" ] || hilang="$hilang DATA_PAT (secret)"
+          [ -n "$ENC_PASS" ] || hilang="$hilang ENC_PASS (secret)"
+          [ -n "$ENV_FILE" ] || hilang="$hilang ENV_FILE (secret)"
+          if [ -n "$hilang" ]; then
+            echo "::error::Belum diisi: $hilang"
+            exit 1
+          fi
+          echo "Repo data  : $DATA_REPO"
+          echo "Ukuran .env: $(printf '%s' "$ENV_FILE" | wc -c) byte"
+
+      - name: Siapkan Python
+        run: |
+          python3 -m venv venv
+          venv/bin/pip install --disable-pip-version-check -q --upgrade pip
+          venv/bin/pip install --disable-pip-version-check -q \
+            -r requirements.txt -r tools/requirements.txt
+
+      - name: Tarik data terenkripsi
+        id: tarik
+        run: venv/bin/python tools/pack.py pull
+
+      - name: Tulis .env
+        run: |
+          printf '%s' "$ENV_FILE" > .env
+          chmod 600 .env
+
+      - name: Cek konfigurasi userbot
+        run: venv/bin/python main.py --cek
+
+      - name: Jalankan supervisor
+        run: venv/bin/python server.py start --maks-waktu 300
+
+      - name: Ringkasan log
+        if: always()
+        run: |
+          echo "--- logs/bot.log (20 terakhir) ---"
+          tail -n 20 logs/bot.log 2>/dev/null || echo "belum ada"
+          echo "--- logs/server.log (20 terakhir) ---"
+          tail -n 20 logs/server.log 2>/dev/null || echo "belum ada"
+
+      - name: Simpan data ke repo privat
+        # Hanya kalau pengambilan data tadi berhasil. Kalau pull gagal
+        # (frasa sandi salah, token kedaluwarsa, jaringan putus) folder
+        # data/ di runner kosong, dan push akan menimpa bundel yang
+        # masih benar di repo privat.
+        if: always() && steps.tarik.outcome == 'success'
+        run: venv/bin/python tools/pack.py push
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-run-${{ github.run_id }}
+          path: |
+            logs/bot.log
+            logs/server.log
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Jadwalkan run berikutnya
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for percobaan in 1 2 3; do
+            if gh api --method POST \
+              "repos/${GITHUB_REPOSITORY}/dispatches" \
+              -f event_type=restart; then
+              echo "Run berikutnya dijadwalkan (percobaan ${percobaan})."
+              exit 0
+            fi
+            echo "Gagal memicu run berikutnya, coba lagi 30 detik lagi."
+            sleep 30
+          done
+          echo "::error::Tidak bisa menjadwalkan run berikutnya; bot berhenti setelah run ini."
+          exit 1
+
+      - name: Heartbeat harian
+        if: always()
+        # Tidak boleh menggagalkan run: heartbeat cuma agar schedule tidak
+        # dimatikan GitHub, jadi kegagalannya ditoleransi.
+        continue-on-error: true
+        run: |
+          # GitHub menonaktifkan workflow ber-schedule bila repo public
+          # tidak menerima commit selama 60 hari. Satu commit kosong per
+          # hari cukup untuk menjaganya tetap aktif.
+          terakhir=$(git log -1 --format=%ct 2>/dev/null || echo 0)
+          sekarang=$(date +%s)
+          if [ $(( sekarang - terakhir )) -gt 82800 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            if git commit --allow-empty -m "heartbeat: userbot masih hidup" && git push; then
+              echo "Heartbeat dikirim."
+            else
+              echo "Heartbeat gagal, diabaikan (repo mungkin sedang dipakai manual)."
+            fi
+          else
+            echo "Repo masih aktif, heartbeat dilewati."
+          fi
